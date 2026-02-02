@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm  # <--- Importamos la librería
+import time
+
+# --- 1. GENERACIÓN DE DATOS Y NORMALIZACIÓN ---
+# Aumentamos a 1000 muestras para que la gráfica no sea puro ruido
+n_samples = 1000
+n_features = 5
+n_groups = 2
+
+# Creamos datos sintéticos
+x_raw = torch.randn(n_samples, n_features)
+y = torch.randint(0, 2, (n_samples, 1)).float()
+groups = torch.randint(0, n_groups, (n_samples,))
+
+# ARREGLO DEL ERROR: Normalización con Scikit-Learn
+scaler = StandardScaler()
+x_train_numpy = x_raw.numpy() 
+x_train_norm = scaler.fit_transform(x_train_numpy)
+x_train = torch.tensor(x_train_norm).float() # Ahora x_train ya está definido
+
+# --- 2. CONFIGURACIÓN DEL MODELO ---
+model = nn.Sequential(
+    nn.Linear(n_features, 10),
+    nn.ReLU(),
+    nn.Linear(10, 1)
+)
+
+# Hiperparámetros más estables
+optimizer = optim.Adam(model.parameters(), lr=0.005) # Adam es más estable que SGD
+criterion = nn.BCEWithLogitsLoss(reduction='none')
+
+n_epochs = 100
+eta = 0.01 # Sensibilidad de GDRO (más bajo = menos saltos locos)
+adv_probs = torch.ones(n_groups) / n_groups
+history = {'loss_g0': [], 'loss_g1': [], 'acc_g0': [], 'acc_g1': []}
+
+# --- 3. CICLO DE ENTRENAMIENTO GDRO ---
+for epoch in range(n_epochs):
+    optimizer.zero_grad()
+    outputs = model(x_train)
+    losses = criterion(outputs, y)
+
+    group_losses = torch.zeros(n_groups)
+    group_accs = torch.zeros(n_groups)
+
+    for i in range(n_groups):
+        mask = (groups == i)
+        if mask.sum() > 0:
+            group_losses[i] = losses[mask].mean()
+            preds = (torch.sigmoid(outputs[mask]) > 0.5).float()
+            group_accs[i] = (preds == y[mask]).float().mean()
+
+    # Actualización de pesos robustos (GDRO)
+    adv_probs = adv_probs * torch.exp(eta * group_losses.detach())
+    adv_probs /= adv_probs.sum()
+    
+    robust_loss = torch.dot(adv_probs, group_losses)
+    robust_loss.backward()
+    optimizer.step()
+
+    # Guardar historial para la gráfica
+    history['loss_g0'].append(group_losses[0].item())
+    history['loss_g1'].append(group_losses[1].item())
+    history['acc_g0'].append(group_accs[0].item())
+    history['acc_g1'].append(group_accs[1].item())
+
+# --- 4. VISUALIZACIÓN DE RESULTADOS ---
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history['loss_g0'], label='Error Grupo A', alpha=0.7)
+plt.plot(history['loss_g1'], label='Error Grupo B', alpha=0.7)
+plt.title('Pérdida (Tendencia a la baja)')
+plt.xlabel('Época')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history['acc_g0'], label='Precisión Grupo A', alpha=0.7)
+plt.plot(history['acc_g1'], label='Precisión Grupo B', alpha=0.7)
+plt.title('Precisión (Convergencia)')
+plt.xlabel('Época')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Desglose final
+print(f"--- Desglose Final de Precisión ---")
+print(f"Grupo A: {history['acc_g0'][-1]:.2%}")
+print(f"Grupo B: {history['acc_g1'][-1]:.2%}")
+print(f"Diferencia (Gap): {abs(history['acc_g0'][-1] - history['acc_g1'][-1]):.2%}")
+
+# --- 5. INTERPRETACIÓN DE RESULTADOS Y DECISIÓN ---
+final_acc_0 = history['acc_g0'][-1]
+final_acc_1 = history['acc_g1'][-1]
+
+# Definimos el umbral de equidad (ej: diferencia menor al 5%)
+gap = abs(final_acc_0 - final_acc_1)
+equitativo = gap < 0.05
+
+print("\n" + "="*30)
+print("🎯 DIAGNÓSTICO DEL MODELO")
+print("="*30)
+
+if equitativo:
+    print(f"ESTADO: Modelo Robusto (Gap: {gap:.2%})")
+    print("DECISIÓN: Se recomienda usar el MODELO GLOBAL.")
+    print("MOTIVO: El modelo ha aprendido a tratar a ambos grupos por igual.")
+else:
+    print(f"ESTADO: Modelo Sesgado (Gap: {gap:.2%})")
+    # Elegimos el grupo "óptimo" basado en la mayor precisión
+    mejor_grupo = "Grupo A" if final_acc_0 > final_acc_1 else "Grupo B"
+    print(f"DECISIÓN: Priorizar el despliegue para el {mejor_grupo}.")
+    print(f"MOTIVO: Existe una disparidad significativa. El {mejor_grupo} es el más confiable actualmente.")
+
+print("="*30)
